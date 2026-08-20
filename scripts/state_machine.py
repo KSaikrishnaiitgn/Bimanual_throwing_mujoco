@@ -1,0 +1,710 @@
+"""
+state_machine.py
+
+Top-level phase state machine for the dual-FR3 dynamic throwing system.
+`ThrowStateMachine.step(t, dt)` is called once per sim step and returns
+`(torque_left(7,), torque_right(7,))` to be written via
+`interface.set_ctrl(...)`.
+
+Every branch of `step` returns a torque tuple -- no branch falls through
+without one, including DONE (zero torque both arms).
+
+FIXED vs. previous versions:
+  1. p_rel is config.RELEASE_POINT -- a planned workspace target the DS
+     controller drives the box TOWARD -- not the box's live position at
+     the moment SQUEEZE_GRASP ends.
+  2. release_velocity.compute_release_velocity(...) returns a dict; v_rel
+     fields are unpacked from it, not the whole dict assigned.
+  3. compute_dual_arm_qdot is imported from ds_impedance_controller.
+  4. ALL phases now run on VelocityPID (velocity control end-to-end, to
+     match the hardware controller this is meant to transfer to).
+     reaching_pd is no longer used anywhere in this file -- retained in
+     joint_controllers.py as unused/available, not deleted.
+       - APPROACH_PREGRASP / APPROACH_GRASP / FOLLOW_THROUGH: still build
+         a TrapezoidalJointTrajectory once per phase entry, but now feed
+         VelocityPID with qdot_cmd = qdot_ref + K_TRACK*(q_ref - q)
+         (feedforward + small position-correction), instead of PD-ing
+         torque directly.
+       - SQUEEZE_GRASP: now a full Cartesian-velocity phase. The pose the
+         arm is actually at when SQUEEZE_GRASP begins is captured once
+         (self.squeeze_target_pos/quat_left/right) and held via a
+         Cartesian proportional term on the 5 non-approach axes; the
+         approach axis is driven by the masked admittance law
+         (contact_admittance.compute_admittance_velocity(..., axis=...)).
+         Both terms are summed into one 6D Cartesian velocity command,
+         mapped through the single-arm Jacobian's damped pseudo-inverse,
+         and tracked by VelocityPID -- same shape as THROW/RELEASE.
+       - F_meas is now read via MjInterface.get_wrench_world (rotates the
+         sensor-local reading into world frame) in SQUEEZE_GRASP, since
+         the masked admittance law's `axis` argument is a world-frame
+         direction and comparing it against a sensor-local F_meas would
+         be comparing different frames. NOTE: THROW and RELEASE still
+         call get_wrench (sensor-local, unrotated) -- this is a known,
+         separate issue flagged but not fixed here; see chat history.
+  5. VelocityPID instances (pid_left/pid_right) are now created fresh at
+     every phase entry and torn down (set to None) at every phase exit,
+     for ALL phases (previously only trajectories followed this
+     lazily-built/reset-on-transition pattern). This isolates each
+     phase's integral term from the very different velocity regimes of
+     its neighbors (e.g. SQUEEZE_GRASP's near-zero hold vs. THROW's
+     large dynamic command) so no stale integral windup crosses a phase
+     boundary.
+"""
+
+from __future__ import annotations
+
+from enum import Enum
+from typing import Optional, TYPE_CHECKING
+
+import mujoco
+import numpy as np
+
+import config.throwing_config as config
+import release_velocity
+from contact_admittance import GraspForceCloser, compute_admittance_velocity
+from ds_impedance_controller import (
+    compute_ds_accel,
+    compute_desired_obj_vel,
+    compute_dual_arm_qdot,
+)
+from dual_arm_kinematics import build_stacked_jacobian, damped_pinv
+from joint_controllers import VelocityPID
+from trajectory_generator import TrapezoidalJointTrajectory
+
+if TYPE_CHECKING:
+    from mj_interface import MjInterface
+
+
+class Phase(Enum):
+    APPROACH_PREGRASP = "APPROACH_PREGRASP"
+    APPROACH_GRASP = "APPROACH_GRASP"
+    SQUEEZE_GRASP = "SQUEEZE_GRASP"
+    THROW = "THROW"
+    RELEASE = "RELEASE"
+    FOLLOW_THROUGH = "FOLLOW_THROUGH"
+    DONE = "DONE"
+
+
+def _slice_for_arm(array: np.ndarray, arm: str) -> np.ndarray:
+    """Same convention as joint_controllers._slice_for_arm: [left(7), right(7)]."""
+    return array[0:7] if arm == "left" else array[7:14]
+
+
+def _quat_error_vec(target_quat: np.ndarray, current_quat: np.ndarray) -> np.ndarray:
+    """3D rotation-vector error from current_quat to target_quat (wxyz in, world frame out).
+    Same construction as ik_solver.py's per-iteration orientation error."""
+    current_quat_inv = np.zeros(4, dtype=np.float64)
+    mujoco.mju_negQuat(current_quat_inv, current_quat)
+    q_err = np.zeros(4, dtype=np.float64)
+    mujoco.mju_mulQuat(q_err, target_quat, current_quat_inv)
+    e_rot = np.zeros(3, dtype=np.float64)
+    mujoco.mju_quat2Vel(e_rot, q_err, 1.0)
+    return e_rot
+
+
+# Per-joint position limits moved to config.py (config.JOINT_RANGES) so
+# ds_impedance_controller.py's nullspace joint-limit-avoidance term can
+# import the same single source of truth. Usages below updated accordingly.
+
+
+class ThrowStateMachine:
+    def __init__(self, interface: "MjInterface"):
+        self.interface = interface
+        self.interface.debug_ee_axes()
+        self.phase = Phase.APPROACH_PREGRASP
+
+        self.pregrasp_left = np.load("pregrasp_left.npy")
+        self.pregrasp_right = np.load("pregrasp_right.npy")
+        self.grasp_left = np.load("grasp_left.npy")
+        self.grasp_right = np.load("grasp_right.npy")
+
+        self.force_closer = GraspForceCloser()
+
+        # VelocityPID instances: created fresh at every phase's first
+        # step, torn down (None) at every phase's transition-out. See
+        # _ensure_velocity_pid / phase transition blocks below.
+        self.pid_left: Optional[VelocityPID] = None
+        self.pid_right: Optional[VelocityPID] = None
+
+        # SQUEEZE_GRASP bookkeeping
+        self.squeeze_start_time: Optional[float] = None
+        self.squeeze_ramp_duration = 0.5  # s, F* ramps 0 -> GRASP_FORCE_MAG
+        self._stable_since: Optional[float] = None  # running "stable since" ts
+        # Pose captured once at APPROACH_GRASP -> SQUEEZE_GRASP transition;
+        # SQUEEZE_GRASP's Cartesian hold term regulates toward this, not a
+        # separately-derived FK target.
+        self.squeeze_target_pos_left: Optional[np.ndarray] = None
+        self.squeeze_target_quat_left: Optional[np.ndarray] = None
+        self.squeeze_target_pos_right: Optional[np.ndarray] = None
+        self.squeeze_target_quat_right: Optional[np.ndarray] = None
+
+        # THROW target. p_rel is fixed to config.RELEASE_POINT -- a planned
+        # workspace target, not a live sensor read. v_rel/t_f are computed
+        # once at the SQUEEZE_GRASP -> THROW transition and never
+        # recomputed for the rest of the throw.
+        self.p_rel: Optional[np.ndarray] = None
+        self.v_rel_vector: Optional[np.ndarray] = None
+        self.v_rel_scalar: Optional[float] = None
+        self.t_f: Optional[float] = None
+        self.t_throw_start: Optional[float] = None
+
+        # RELEASE bookkeeping
+        self.release_time: Optional[float] = None
+        self.release_retract_duration = 0.1  # s
+        self.release_retract_speed = 0.05  # m/s, outward along approach axis
+
+        # Velocity-command clipping flags for the most recent step. Reset
+        # at the top of every step() call; set by _update_vel_clipped_flags
+        # in every phase now (all phases run VelocityPID).
+        self.vel_clipped_left: bool = False
+        self.vel_clipped_right: bool = False
+
+        # Reaching-phase trajectory bookkeeping. Created lazily on first
+        # step() of a phase that needs one (APPROACH_PREGRASP,
+        # APPROACH_GRASP, FOLLOW_THROUGH), using the arm's actual current
+        # joint state at that instant as the trajectory start. Reset to
+        # None whenever that phase's transition fires, so the next phase
+        # builds a fresh one.
+        self.traj_left: Optional[TrapezoidalJointTrajectory] = None
+        self.traj_right: Optional[TrapezoidalJointTrajectory] = None
+        self.traj_start_time: Optional[float] = None
+
+    # ------------------------------------------------------------------
+    # main dispatch
+    # ------------------------------------------------------------------
+    def step(self, t: float, dt: float) -> tuple[np.ndarray, np.ndarray]:
+        self.vel_clipped_left = False
+        self.vel_clipped_right = False
+        self._ensure_velocity_pid()
+
+        if self.phase == Phase.APPROACH_PREGRASP:
+            return self._step_approach_pregrasp(t, dt)
+        elif self.phase == Phase.APPROACH_GRASP:
+            return self._step_approach_grasp(t, dt)
+        elif self.phase == Phase.SQUEEZE_GRASP:
+            return self._step_squeeze_grasp(t, dt)
+        elif self.phase == Phase.THROW:
+            return self._step_throw(t, dt)
+        elif self.phase == Phase.RELEASE:
+            return self._step_release(t, dt)
+        elif self.phase == Phase.FOLLOW_THROUGH:
+            return self._step_follow_through(t, dt)
+        elif self.phase == Phase.DONE:
+            return self._step_done()
+        else:
+            raise RuntimeError(f"Unhandled phase: {self.phase!r}")
+
+    # ------------------------------------------------------------------
+    # VelocityPID lifecycle helper (mirrors _ensure_trajectory's lazy-
+    # build-once-per-phase pattern)
+    # ------------------------------------------------------------------
+    def _ensure_velocity_pid(self) -> None:
+        if self.pid_left is None or self.pid_right is None:
+            self.pid_left = VelocityPID("left")
+            self.pid_right = VelocityPID("right")
+
+    def _reset_velocity_pid(self) -> None:
+        self.pid_left = None
+        self.pid_right = None
+
+    # ------------------------------------------------------------------
+    # Trajectory helper (used by APPROACH_PREGRASP / APPROACH_GRASP /
+    # FOLLOW_THROUGH -- the three phases that reach toward a distant
+    # target rather than holding position).
+    # ------------------------------------------------------------------
+    def _ensure_trajectory(
+        self, target_left: np.ndarray, target_right: np.ndarray, t: float
+    ) -> None:
+        """Lazily build this phase's trapezoidal trajectories, once."""
+        if self.traj_left is None or self.traj_right is None:
+            q_left = self.interface.get_qpos("left")
+            q_right = self.interface.get_qpos("right")
+            self.traj_left = TrapezoidalJointTrajectory(
+                q_left, target_left,
+                config.MAX_JOINT_VELOCITIES[0:7], config.MAX_JOINT_ACCELERATIONS[0:7],
+            )
+            self.traj_right = TrapezoidalJointTrajectory(
+                q_right, target_right,
+                config.MAX_JOINT_VELOCITIES[7:14], config.MAX_JOINT_ACCELERATIONS[7:14],
+            )
+            self.traj_start_time = t
+
+    def _traj_tracking_qdot_cmd(
+        self, q: np.ndarray, q_ref: np.ndarray, qdot_ref: np.ndarray, arm: str
+    ) -> np.ndarray:
+        """qdot_cmd = qdot_ref + K_TRACK * (q_ref - q) -- feedforward
+        trajectory velocity plus a small proportional correction against
+        drift, still expressed purely as a velocity command (no torque
+        term), so it transfers directly to a hardware velocity-controller
+        interface."""
+        k_track = _slice_for_arm(config.K_TRACK, arm)
+        return qdot_ref + k_track * (q_ref - q)
+
+    # ------------------------------------------------------------------
+    # APPROACH_PREGRASP
+    # ------------------------------------------------------------------
+    def _step_approach_pregrasp(self, t: float, dt: float) -> tuple[np.ndarray, np.ndarray]:
+        self._ensure_trajectory(self.pregrasp_left, self.pregrasp_right, t)
+        elapsed = t - self.traj_start_time
+        q_ref_left, qdot_ref_left, traj_done_left = self.traj_left.sample(elapsed)
+        q_ref_right, qdot_ref_right, traj_done_right = self.traj_right.sample(elapsed)
+
+        q_left = self.interface.get_qpos("left")
+        qvel_left = self.interface.get_qvel("left")
+        q_right = self.interface.get_qpos("right")
+        qvel_right = self.interface.get_qvel("right")
+
+        qdot_cmd_left = self._traj_tracking_qdot_cmd(q_left, q_ref_left, qdot_ref_left, "left")
+        qdot_cmd_right = self._traj_tracking_qdot_cmd(q_right, q_ref_right, qdot_ref_right, "right")
+
+        self._update_vel_clipped_flags(qdot_cmd_left, qdot_cmd_right)
+
+        torque_left = self.pid_left.step(
+            qvel_left, qdot_cmd_left, dt,
+            bias_torque=self.interface.get_bias_torque("left"),
+        )
+        torque_right = self.pid_right.step(
+            qvel_right, qdot_cmd_right, dt,
+            bias_torque=self.interface.get_bias_torque("right"),
+        )
+
+        # Phase transition gates on the FINAL target, not the moving
+        # reference.
+        pos_thresh_left = config.POSITION_THRESHOLDS[0:7]
+        pos_thresh_right = config.POSITION_THRESHOLDS[7:14]
+        at_goal_left = np.all(np.abs(self.pregrasp_left - q_left) < pos_thresh_left)
+        at_goal_right = np.all(np.abs(self.pregrasp_right - q_right) < pos_thresh_right)
+
+        if traj_done_left and traj_done_right and at_goal_left and at_goal_right:
+            self.phase = Phase.APPROACH_GRASP
+            self.traj_left = None
+            self.traj_right = None
+            self._reset_velocity_pid()
+
+        return torque_left, torque_right
+
+    # ------------------------------------------------------------------
+    # APPROACH_GRASP
+    # ------------------------------------------------------------------
+    def _step_approach_grasp(self, t: float, dt: float) -> tuple[np.ndarray, np.ndarray]:
+        self._ensure_trajectory(self.grasp_left, self.grasp_right, t)
+        elapsed = t - self.traj_start_time
+        q_ref_left, qdot_ref_left, traj_done_left = self.traj_left.sample(elapsed)
+        q_ref_right, qdot_ref_right, traj_done_right = self.traj_right.sample(elapsed)
+
+        q_left = self.interface.get_qpos("left")
+        qvel_left = self.interface.get_qvel("left")
+        q_right = self.interface.get_qpos("right")
+        qvel_right = self.interface.get_qvel("right")
+
+        qdot_cmd_left = self._traj_tracking_qdot_cmd(q_left, q_ref_left, qdot_ref_left, "left")
+        qdot_cmd_right = self._traj_tracking_qdot_cmd(q_right, q_ref_right, qdot_ref_right, "right")
+
+        self._update_vel_clipped_flags(qdot_cmd_left, qdot_cmd_right)
+
+        torque_left = self.pid_left.step(
+            qvel_left, qdot_cmd_left, dt,
+            bias_torque=self.interface.get_bias_torque("left"),
+        )
+        torque_right = self.pid_right.step(
+            qvel_right, qdot_cmd_right, dt,
+            bias_torque=self.interface.get_bias_torque("right"),
+        )
+
+        pos_thresh_left = config.POSITION_THRESHOLDS[0:7]
+        pos_thresh_right = config.POSITION_THRESHOLDS[7:14]
+        at_goal_left = np.all(np.abs(self.grasp_left - q_left) < pos_thresh_left)
+        at_goal_right = np.all(np.abs(self.grasp_right - q_right) < pos_thresh_right)
+
+        # Fallback: if the arm has stopped moving (stalled against contact
+        # with the box) and is within a looser tolerance of the grasp
+        # target, treat that as "reached" too. The tight at_goal check
+        # above can permanently deadlock this phase once the pad contacts
+        # the box, since the rigid joint-space target assumes free-space
+        # reachability.
+        settled_left = np.all(np.abs(qvel_left) < config.APPROACH_SETTLE_QVEL)
+        settled_right = np.all(np.abs(qvel_right) < config.APPROACH_SETTLE_QVEL)
+        close_left = np.all(np.abs(self.grasp_left - q_left) < config.APPROACH_GRASP_POS_TOLERANCE)
+        close_right = np.all(np.abs(self.grasp_right - q_right) < config.APPROACH_GRASP_POS_TOLERANCE)
+        reached_grasp = (at_goal_left and at_goal_right) or (
+            settled_left and settled_right and close_left and close_right
+        )
+
+        if traj_done_left and traj_done_right and reached_grasp:
+            self.phase = Phase.SQUEEZE_GRASP
+            self.squeeze_start_time = t
+            self._stable_since = None  # fresh stability window
+            self.traj_left = None
+            self.traj_right = None
+            self._reset_velocity_pid()
+
+            # Capture the pose the arm is actually AT right now as the
+            # target SQUEEZE_GRASP's Cartesian hold term will regulate
+            # toward, for the 5 non-approach axes.
+            pos_left, quat_left = self.interface.get_site_pose(config.LEFT_EE_SITE)
+            pos_right, quat_right = self.interface.get_site_pose(config.RIGHT_EE_SITE)
+            self.squeeze_target_pos_left = pos_left
+            self.squeeze_target_quat_left = quat_left
+            self.squeeze_target_pos_right = pos_right
+            self.squeeze_target_quat_right = quat_right
+
+        return torque_left, torque_right
+
+    # ------------------------------------------------------------------
+    # SQUEEZE_GRASP -- Cartesian-velocity hold: masked admittance on the
+    # approach axis, Cartesian P-hold on the other 5 axes, summed and
+    # mapped through the single-arm Jacobian pinv, tracked by VelocityPID.
+    # ------------------------------------------------------------------
+    def _step_squeeze_grasp(self, t: float, dt: float) -> tuple[np.ndarray, np.ndarray]:
+        qvel_left = self.interface.get_qvel("left")
+        qvel_right = self.interface.get_qvel("right")
+
+        ramp_frac = min(1.0, (t - self.squeeze_start_time) / self.squeeze_ramp_duration)
+        F_star_left = ramp_frac * config.desired_wrench("left")
+        F_star_right = ramp_frac * config.desired_wrench("right")
+
+        # World-frame F_meas -- required since the masked admittance law's
+        # `axis` argument (LEFT/RIGHT_PAD_APPROACH_AXIS_WORLD) is a world
+        # direction; comparing it against a sensor-local reading would
+        # silently compare different frames.
+        F_meas_left = self.interface.get_wrench_world(
+            "left", config.LEFT_FORCE_SENSOR, config.LEFT_TORQUE_SENSOR
+        )
+        F_meas_right = self.interface.get_wrench_world(
+            "right", config.RIGHT_FORCE_SENSOR, config.RIGHT_TORQUE_SENSOR
+        )
+
+        xdot_admittance_left = compute_admittance_velocity(
+            F_star_left, F_meas_left, axis=config.LEFT_PAD_APPROACH_AXIS_WORLD
+        )
+        xdot_admittance_right = compute_admittance_velocity(
+            F_star_right, F_meas_right, axis=config.RIGHT_PAD_APPROACH_AXIS_WORLD
+        )
+        # Cartesian hold term for the 5 non-approach axes.
+        xdot_hold_left = self._squeeze_hold_velocity(
+            "left", self.squeeze_target_pos_left, self.squeeze_target_quat_left,
+            config.LEFT_PAD_APPROACH_AXIS_WORLD,
+        )
+        xdot_hold_right = self._squeeze_hold_velocity(
+            "right", self.squeeze_target_pos_right, self.squeeze_target_quat_right,
+            config.RIGHT_PAD_APPROACH_AXIS_WORLD,
+        )
+
+        xdot_left = xdot_admittance_left + xdot_hold_left
+        xdot_right = xdot_admittance_right + xdot_hold_right
+
+        J_left = self.interface.get_site_jacobian(config.LEFT_EE_SITE, "left")
+        J_right = self.interface.get_site_jacobian(config.RIGHT_EE_SITE, "right")
+        qdot_cmd_left = damped_pinv(J_left) @ xdot_left
+        qdot_cmd_right = damped_pinv(J_right) @ xdot_right
+        
+        # ---- DEBUG: SQUEEZE_GRASP diagnostic (remove after diagnosing) ----
+        if int(round(t / dt)) % 250 == 0:  # ~every 0.5s
+            axis_l = config.LEFT_PAD_APPROACH_AXIS_WORLD
+            axis_r = config.RIGHT_PAD_APPROACH_AXIS_WORLD
+            print(
+                f"[SQUEEZE t={t:.3f}] "
+                f"F_meas_L={np.linalg.norm(F_meas_left[:3]):.3f}N "
+                f"F_meas_R={np.linalg.norm(F_meas_right[:3]):.3f}N | "
+                f"xdot_adm_L(axis)={np.dot(xdot_admittance_left[:3], axis_l):+.5f} "
+                f"xdot_adm_R(axis)={np.dot(xdot_admittance_right[:3], axis_r):+.5f} m/s | "
+                f"|xdot_L|={np.linalg.norm(xdot_left[:3]):.5f} "
+                f"|xdot_R|={np.linalg.norm(xdot_right[:3]):.5f} m/s | "
+                f"max|qdot_cmd_L|={np.max(np.abs(qdot_cmd_left)):.5f} "
+                f"max|qdot_cmd_R|={np.max(np.abs(qdot_cmd_right)):.5f} rad/s | "
+                f"max|qvel_L|={np.max(np.abs(qvel_left)):.5f} "
+                f"max|qvel_R|={np.max(np.abs(qvel_right)):.5f} rad/s"
+                f"  signed F_meas_L(axis)={np.dot(F_meas_left[:3], axis_l):+.3f}N "
+                f"signed F_meas_R(axis)={np.dot(F_meas_right[:3], axis_r):+.3f}N | "
+                f"F_star_L(axis)={np.dot(F_star_left[:3], axis_l):+.3f}N "
+                f"F_star_R(axis)={np.dot(F_star_right[:3], axis_r):+.3f}N"
+                f" | right_fr3_joint1 qpos={self.interface.get_qpos('right')[0]:+.4f}rad"
+                f" (range=[{config.JOINT_RANGES[7,0]:+.4f},{config.JOINT_RANGES[7,1]:+.4f}])"
+                f"[FORCE DEBUG t={t:.3f}] "
+                f"L F=[{F_meas_left[0]:+.3f}, {F_meas_left[1]:+.3f}, {F_meas_left[2]:+.3f}] "
+                f"axis=[{axis_l[0]:+.3f}, {axis_l[1]:+.3f}, {axis_l[2]:+.3f}] | "
+                f"R F=[{F_meas_right[0]:+.3f}, {F_meas_right[1]:+.3f}, {F_meas_right[2]:+.3f}] "
+                f"axis=[{axis_r[0]:+.3f}, {axis_r[1]:+.3f}, {axis_r[2]:+.3f}]"
+            )
+        # ---- END DEBUG ----
+
+        self._update_vel_clipped_flags(qdot_cmd_left, qdot_cmd_right)
+
+        torque_left = self.pid_left.step(
+            qvel_left, qdot_cmd_left, dt,
+            bias_torque=self.interface.get_bias_torque("left"),
+        )
+        torque_right = self.pid_right.step(
+            qvel_right, qdot_cmd_right, dt,
+            bias_torque=self.interface.get_bias_torque("right"),
+        )
+        
+        left_ok = abs(
+            np.linalg.norm(F_meas_left[:3]) - config.GRASP_FORCE_MAG
+        ) < config.GRASP_STABLE_FORCE_TOL
+        right_ok = abs(
+            np.linalg.norm(F_meas_right[:3]) - config.GRASP_FORCE_MAG
+        ) < config.GRASP_STABLE_FORCE_TOL
+
+        if left_ok and right_ok:
+            if self._stable_since is None:
+                self._stable_since = t
+        else:
+            self._stable_since = None
+
+        if (
+            self._stable_since is not None
+            and (t - self._stable_since) >= config.GRASP_STABLE_HOLD_TIME
+        ):
+            self.p_rel = config.RELEASE_POINT.copy()
+            release_soln = release_velocity.compute_release_velocity(
+                self.p_rel, config.LANDING_POINT, config.THROW_ANGLE
+            )
+            self.v_rel_vector = release_soln["v_rel_vector"]
+            self.v_rel_scalar = release_soln["v_rel_scalar"]
+            self.t_f = release_soln["t_f"]
+            self.t_throw_start = t
+            self.phase = Phase.THROW
+            self._reset_velocity_pid()
+
+        return torque_left, torque_right
+
+    def _squeeze_hold_velocity(
+        self, arm: str, target_pos: np.ndarray, target_quat: np.ndarray,
+        approach_axis: np.ndarray,
+    ) -> np.ndarray:
+        """Cartesian proportional velocity command holding `arm`'s EE site
+        near (target_pos, target_quat), with the approach-axis component
+        of the translational term projected out (that axis is owned by
+        the admittance term, not this one)."""
+        site_name = config.LEFT_EE_SITE if arm == "left" else config.RIGHT_EE_SITE
+        pos, quat = self.interface.get_site_pose(site_name)
+
+        pos_err = target_pos - pos
+        axis_unit = approach_axis / np.linalg.norm(approach_axis)
+        pos_err_lateral = pos_err - np.dot(pos_err, axis_unit) * axis_unit
+
+        rot_err = _quat_error_vec(target_quat, quat)
+
+        xdot_lin = config.K_SQUEEZE_HOLD_LIN * pos_err_lateral
+        xdot_ang = config.K_SQUEEZE_HOLD_ANG * rot_err
+        return np.concatenate([xdot_lin, xdot_ang])
+
+    # ------------------------------------------------------------------
+    # THROW
+    # ------------------------------------------------------------------
+    def _step_throw(self, t: float, dt: float) -> tuple[np.ndarray, np.ndarray]:
+        obj_state = self.interface.get_object_state()
+        x_o = obj_state["pos"]
+        xdot_o = obj_state["linvel"]
+
+        qvel_left = self.interface.get_qvel("left")
+        qvel_right = self.interface.get_qvel("right")
+
+        x_rel = self.p_rel
+        xdot_rel = self.v_rel_vector
+
+        x_ddot_des = compute_ds_accel(x_o, xdot_o, x_rel, xdot_rel)
+        x_o_star_dot = compute_desired_obj_vel(
+            xdot_o,
+            x_ddot_des,
+            np.zeros(3),
+            np.array([0.0, 0.0, -config.OBJECT_MASS * config.GRAVITY]),
+            x_rel,
+            x_o,
+        )
+
+        F_star_left = self.force_closer.target_wrench("left")
+        F_star_right = self.force_closer.target_wrench("right")
+        # NOTE: still sensor-local, unrotated -- same known frame issue
+        # flagged for SQUEEZE_GRASP, not fixed here (out of stated scope).
+        F_meas_left = self.interface.get_wrench(
+            config.LEFT_FORCE_SENSOR, config.LEFT_TORQUE_SENSOR
+        )
+        F_meas_right = self.interface.get_wrench(
+            config.RIGHT_FORCE_SENSOR, config.RIGHT_TORQUE_SENSOR
+        )
+
+        xdot_admittance_left = compute_admittance_velocity(F_star_left, F_meas_left)
+        xdot_admittance_right = compute_admittance_velocity(F_star_right, F_meas_right)
+
+        # ---- DEBUG: contact-loss window (remove after diagnosing) ----
+        if 6.6 <= t <= 7.2:
+            print(
+                f"[THROW-CONTACT t={t:.3f}] "
+                f"|F_meas_L|={np.linalg.norm(F_meas_left[:3]):.4f}N "
+                f"|F_meas_R|={np.linalg.norm(F_meas_right[:3]):.4f}N "
+                f"F_star_L={np.linalg.norm(F_star_left[:3]):.4f} "
+                f"F_star_R={np.linalg.norm(F_star_right[:3]):.4f} "
+                f"x_o_z={x_o[2]:.4f}"
+            )
+        # ---- END DEBUG ----
+
+        xdot_stack = np.concatenate([xdot_admittance_left, xdot_admittance_right])
+        x_dot_obj_star_6d = np.concatenate([x_o_star_dot, np.zeros(3)])
+
+        J_H = build_stacked_jacobian(self.interface)
+        J_H_pinv = damped_pinv(J_H)
+        q_all = np.concatenate([
+            self.interface.get_qpos("left"), self.interface.get_qpos("right")
+        ])
+        qdot_cmd = compute_dual_arm_qdot(
+            J_H_pinv, xdot_stack, x_dot_obj_star_6d,
+            J_H=J_H, q=q_all, joint_ranges=config.JOINT_RANGES,
+            k_joint_limit=config.K_JOINT_LIMIT_AVOID,
+        )
+        qdot_cmd_left, qdot_cmd_right = qdot_cmd[0:7], qdot_cmd[7:14]
+        # ---- DEBUG: singular value / joint-limit diagnostic (remove after diagnosing) ----
+        U_svd, S_svd, _ = np.linalg.svd(J_H)
+        sv_min = S_svd[-1]
+        near_singular = sv_min < 0.001
+        log_this_step = (int(round(t / dt)) % 250 == 0) or (near_singular and int(round(t / dt)) % 10 == 0)
+        if log_this_step:
+            dist = np.linalg.norm(x_o - self.p_rel)
+            q_left_dbg = self.interface.get_qpos("left")
+            q_right_dbg = self.interface.get_qpos("right")
+            q_all_dbg = np.concatenate([q_left_dbg, q_right_dbg])
+            margin_lo = q_all_dbg - config.JOINT_RANGES[:, 0]
+            margin_hi = config.JOINT_RANGES[:, 1] - q_all_dbg
+            margin = np.minimum(margin_lo, margin_hi)
+            worst_idx = int(np.argmin(margin))
+            worst_name = (config.LEFT_JOINT_NAMES + config.RIGHT_JOINT_NAMES)[worst_idx]
+            worst_dir = U_svd[:, -1]
+            worst_dir_left, worst_dir_right = worst_dir[0:6], worst_dir[6:12]
+            # ---- END DEBUG ----
+            print(f"[THROW t={t:.3f}] x_o={x_o} xdot_o={xdot_o} dist_to_p_rel={dist:.4f} x_ddot_des={x_ddot_des} x_o_star_dot={x_o_star_dot} max|qdot_cmd_L|={np.max(np.abs(qdot_cmd_left)):.4f} max|qdot_cmd_R|={np.max(np.abs(qdot_cmd_right)):.4f} max|qvel_L|={np.max(np.abs(qvel_left)):.5f} max|qvel_R|={np.max(np.abs(qvel_right)):.5f} J_H_sv_min={sv_min:.6f} worst_joint={worst_name} worst_margin={margin[worst_idx]:.4f}rad right_fr3_joint1_qpos={q_all_dbg[7]:+.4f}rad")
+            print(f"    [SINGULAR DIR t={t:.3f}] left_twist(lin,ang)={np.round(worst_dir_left,3)} right_twist(lin,ang)={np.round(worst_dir_right,3)} full_q={np.round(q_all_dbg,4)}")
+
+        self._update_vel_clipped_flags(qdot_cmd_left, qdot_cmd_right)
+
+        torque_left = self.pid_left.step(
+            qvel_left, qdot_cmd_left, dt,
+            bias_torque=self.interface.get_bias_torque("left"),
+        )
+        torque_right = self.pid_right.step(
+            qvel_right, qdot_cmd_right, dt,
+            bias_torque=self.interface.get_bias_torque("right"),
+        )
+
+        if np.linalg.norm(x_o - self.p_rel) < config.RELEASE_POS_TOLERANCE:
+            self.force_closer.deactivate()
+            self.release_time = t
+            self.phase = Phase.RELEASE
+            self._reset_velocity_pid()
+
+        return torque_left, torque_right
+
+    # ------------------------------------------------------------------
+    # RELEASE
+    # ------------------------------------------------------------------
+    def _step_release(self, t: float, dt: float) -> tuple[np.ndarray, np.ndarray]:
+        qvel_left = self.interface.get_qvel("left")
+        qvel_right = self.interface.get_qvel("right")
+
+        F_star_left = self.force_closer.target_wrench("left")
+        F_star_right = self.force_closer.target_wrench("right")
+        F_meas_left = self.interface.get_wrench(
+            config.LEFT_FORCE_SENSOR, config.LEFT_TORQUE_SENSOR
+        )
+        F_meas_right = self.interface.get_wrench(
+            config.RIGHT_FORCE_SENSOR, config.RIGHT_TORQUE_SENSOR
+        )
+
+        xdot_admittance_left = compute_admittance_velocity(F_star_left, F_meas_left)
+        xdot_admittance_right = compute_admittance_velocity(F_star_right, F_meas_right)
+
+        elapsed = t - self.release_time
+        if elapsed < self.release_retract_duration:
+            outward_left = (
+                -self.release_retract_speed * config.LEFT_PAD_APPROACH_AXIS_WORLD
+            )
+            outward_right = (
+                -self.release_retract_speed * config.RIGHT_PAD_APPROACH_AXIS_WORLD
+            )
+            xdot_admittance_left = xdot_admittance_left + np.concatenate(
+                [outward_left, np.zeros(3)]
+            )
+            xdot_admittance_right = xdot_admittance_right + np.concatenate(
+                [outward_right, np.zeros(3)]
+            )
+
+        xdot_stack = np.concatenate([xdot_admittance_left, xdot_admittance_right])
+        x_dot_obj_star_6d = np.zeros(6)
+
+        J_H = build_stacked_jacobian(self.interface)
+        J_H_pinv = damped_pinv(J_H)
+        qdot_cmd = compute_dual_arm_qdot(J_H_pinv, xdot_stack, x_dot_obj_star_6d)
+        qdot_cmd_left, qdot_cmd_right = qdot_cmd[0:7], qdot_cmd[7:14]
+
+        self._update_vel_clipped_flags(qdot_cmd_left, qdot_cmd_right)
+
+        torque_left = self.pid_left.step(
+            qvel_left, qdot_cmd_left, dt,
+            bias_torque=self.interface.get_bias_torque("left"),
+        )
+        torque_right = self.pid_right.step(
+            qvel_right, qdot_cmd_right, dt,
+            bias_torque=self.interface.get_bias_torque("right"),
+        )
+
+        if elapsed >= self.release_retract_duration:
+            self.phase = Phase.FOLLOW_THROUGH
+            self._reset_velocity_pid()
+
+        return torque_left, torque_right
+
+    # ------------------------------------------------------------------
+    # FOLLOW_THROUGH
+    # ------------------------------------------------------------------
+    def _step_follow_through(self, t: float, dt: float) -> tuple[np.ndarray, np.ndarray]:
+        self._ensure_trajectory(self.pregrasp_left, self.pregrasp_right, t)
+        elapsed = t - self.traj_start_time
+        q_ref_left, qdot_ref_left, traj_done_left = self.traj_left.sample(elapsed)
+        q_ref_right, qdot_ref_right, traj_done_right = self.traj_right.sample(elapsed)
+
+        q_left = self.interface.get_qpos("left")
+        qvel_left = self.interface.get_qvel("left")
+        q_right = self.interface.get_qpos("right")
+        qvel_right = self.interface.get_qvel("right")
+
+        qdot_cmd_left = self._traj_tracking_qdot_cmd(q_left, q_ref_left, qdot_ref_left, "left")
+        qdot_cmd_right = self._traj_tracking_qdot_cmd(q_right, q_ref_right, qdot_ref_right, "right")
+
+        self._update_vel_clipped_flags(qdot_cmd_left, qdot_cmd_right)
+
+        torque_left = self.pid_left.step(
+            qvel_left, qdot_cmd_left, dt,
+            bias_torque=self.interface.get_bias_torque("left"),
+        )
+        torque_right = self.pid_right.step(
+            qvel_right, qdot_cmd_right, dt,
+            bias_torque=self.interface.get_bias_torque("right"),
+        )
+
+        pos_thresh_left = config.POSITION_THRESHOLDS[0:7]
+        pos_thresh_right = config.POSITION_THRESHOLDS[7:14]
+        at_goal_left = np.all(np.abs(self.pregrasp_left - q_left) < pos_thresh_left)
+        at_goal_right = np.all(np.abs(self.pregrasp_right - q_right) < pos_thresh_right)
+
+        if traj_done_left and traj_done_right and at_goal_left and at_goal_right:
+            self.phase = Phase.DONE
+            self.traj_left = None
+            self.traj_right = None
+            self._reset_velocity_pid()
+
+        return torque_left, torque_right
+
+    # ------------------------------------------------------------------
+    # DONE
+    # ------------------------------------------------------------------
+    def _step_done(self) -> tuple[np.ndarray, np.ndarray]:
+        return np.zeros(7), np.zeros(7)
+
+    # ------------------------------------------------------------------
+    def _update_vel_clipped_flags(self, qdot_cmd_left: np.ndarray, qdot_cmd_right: np.ndarray) -> None:
+        max_vel_left = config.MAX_JOINT_VELOCITIES[0:7]
+        max_vel_right = config.MAX_JOINT_VELOCITIES[7:14]
+        clipped_left = np.clip(qdot_cmd_left, -max_vel_left, max_vel_left)
+        clipped_right = np.clip(qdot_cmd_right, -max_vel_right, max_vel_right)
+        self.vel_clipped_left = not np.allclose(clipped_left, qdot_cmd_left)
+        self.vel_clipped_right = not np.allclose(clipped_right, qdot_cmd_right)
