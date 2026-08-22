@@ -1,0 +1,648 @@
+\documentclass[aspectratio=169]{beamer}
+
+\usepackage{amsmath}
+\usepackage{amssymb}
+\usepackage{bm}
+\usepackage{mathtools}
+
+\title{Terminal-State Trajectory Formulation for Dynamic Throwing}
+\subtitle{Ballistic planning, finite-time motion generation, and dual-arm control}
+\author{IITGN ROBOTICS}
+\institute{IIT Gandhinagar}
+
+\newcommand{\vect}[1]{\bm{#1}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\diag}{\operatorname{diag}}
+
+\begin{document}
+
+%------------------------------------------------
+\begin{frame}
+    \titlepage
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Goal of the New Formulation}
+
+The object must pass through a prescribed release state,
+not settle at a stationary equilibrium:
+\[
+\boxed{
+\vect{x}(T)=\vect{x}_{\mathrm{rel}},
+\qquad
+\dot{\vect{x}}(T)=\vect{v}_{\mathrm{rel}}
+}
+\]
+
+\begin{itemize}
+    \item $\vect{x}_{\mathrm{rel}}$: desired object position at release.
+    \item $\vect{v}_{\mathrm{rel}}$: velocity required to reach the landing point.
+    \item $T$: duration of the controlled pre-release motion.
+    \item At $t=T$, the object is moving; it is not at rest.
+\end{itemize}
+
+The formulation therefore has two parts:
+\begin{enumerate}
+    \item Compute the ballistic terminal velocity $\vect{v}_{\mathrm{rel}}$.
+    \item Construct a finite-time trajectory that reaches
+    $(\vect{x}_{\mathrm{rel}},\vect{v}_{\mathrm{rel}})$.
+\end{enumerate}
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Why the Earlier Autonomous DS Is Inappropriate}
+
+The earlier formulation had the form
+\[
+\ddot{\vect{x}}
+=-\vect{K}_{\mathrm{DS}}(\vect{x}-\vect{x}_{\mathrm{rel}})
+-\vect{B}_{\mathrm{DS}}(\dot{\vect{x}}-\vect{v}_{\mathrm{rel}}).
+\]
+
+At an equilibrium, $\dot{\vect{x}}=\vect{0}$ and
+$\ddot{\vect{x}}=\vect{0}$. Therefore,
+\[
+\vect{K}_{\mathrm{DS}}(\vect{x}_{\mathrm{eq}}-\vect{x}_{\mathrm{rel}})
+=\vect{B}_{\mathrm{DS}}\vect{v}_{\mathrm{rel}},
+\]
+and hence
+\[
+\boxed{
+\vect{x}_{\mathrm{eq}}
+=\vect{x}_{\mathrm{rel}}
++\vect{K}_{\mathrm{DS}}^{-1}\vect{B}_{\mathrm{DS}}
+\vect{v}_{\mathrm{rel}},
+\qquad
+\vect{v}_{\mathrm{eq}}=\vect{0}
+}
+\]
+
+Thus, for $\vect{v}_{\mathrm{rel}}\neq\vect{0}$, the desired release
+state is not an equilibrium of the earlier DS. A terminal trajectory is
+needed instead.
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 1: Define the Ballistic Geometry}
+
+Let
+\[
+\vect{p}_{\mathrm{rel}}
+=\begin{bmatrix}x_{\mathrm{rel}}&y_{\mathrm{rel}}&z_{\mathrm{rel}}\end{bmatrix}^{T},
+\qquad
+\vect{p}_{\mathrm{land}}
+=\begin{bmatrix}x_{\mathrm{land}}&y_{\mathrm{land}}&z_{\mathrm{land}}\end{bmatrix}^{T}.
+\]
+
+The displacement is
+\[
+\Delta\vect{p}=\vect{p}_{\mathrm{land}}-\vect{p}_{\mathrm{rel}}.
+\]
+
+Its horizontal range and horizontal direction are
+\[
+R=\left\|\Delta\vect{p}_{xy}\right\|,
+\qquad
+\hat{\vect{e}}_{h}
+=\frac{\Delta\vect{p}_{xy}}{R},
+\]
+where $\Delta\vect{p}_{xy}=[\Delta p_x,\Delta p_y]^T$.
+
+The vertical displacement is
+\[
+\Delta z=z_{\mathrm{land}}-z_{\mathrm{rel}}.
+\]
+
+The world-up direction is fixed as
+\[
+\hat{\vect{z}}=\begin{bmatrix}0&0&1\end{bmatrix}^{T}.
+\]
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 2: Projectile Motion Under Gravity}
+
+During free flight, gravity is
+\[
+\vect{g}=\begin{bmatrix}0&0&-g\end{bmatrix}^{T},
+\qquad g>0.
+\]
+
+Ignoring aerodynamic drag, the object position is
+\[
+\boxed{
+\vect{p}(t)
+=\vect{p}_{\mathrm{rel}}
++\vect{v}_{\mathrm{rel}}t
++\frac{1}{2}\vect{g}t^2
+}
+\]
+
+For a chosen launch angle $\theta$, write the release velocity as
+\[
+\boxed{
+\vect{v}_{\mathrm{rel}}
+=v_{\mathrm{rel}}\cos\theta
+\begin{bmatrix}\hat{\vect{e}}_{h}\\0\end{bmatrix}
++v_{\mathrm{rel}}\sin\theta\,\hat{\vect{z}}
+}
+\]
+
+Here $v_{\mathrm{rel}}=\|\vect{v}_{\mathrm{rel}}\|$ is the unknown
+release speed.
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 3: Derive the Required Release Speed}
+
+Horizontal motion gives the flight time
+\[
+R=v_{\mathrm{rel}}\cos\theta\,t_f
+\quad\Longrightarrow\quad
+t_f=\frac{R}{v_{\mathrm{rel}}\cos\theta}.
+\]
+
+Vertical motion at landing gives
+\[
+\Delta z
+=v_{\mathrm{rel}}\sin\theta\,t_f
+-\frac{1}{2}gt_f^2.
+\]
+
+Substituting the horizontal flight time,
+\[
+\Delta z
+=R\tan\theta
+-\frac{gR^2}{2v_{\mathrm{rel}}^2\cos^2\theta}.
+\]
+
+Solving for the release speed,
+\[
+\boxed{
+v_{\mathrm{rel}}
+=\sqrt{
+\frac{gR^2}
+{2\cos^2\theta\left(R\tan\theta-\Delta z\right)}
+}
+}
+\]
+
+A real solution requires
+$R\tan\theta-\Delta z>0$.
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 4: Measure the Initial Throw State}
+
+When the controller enters the throw phase at time $t_0$, it measures
+the actual object state:
+\[
+\boxed{
+\vect{x}_0=\vect{x}(t_0),
+\qquad
+\vect{v}_0=\dot{\vect{x}}(t_0)
+}
+\]
+
+The desired terminal state is
+\[
+\boxed{
+\vect{x}_f=\vect{x}_{\mathrm{rel}},
+\qquad
+\vect{v}_f=\vect{v}_{\mathrm{rel}}
+}
+\]
+
+The pre-release trajectory must satisfy four boundary conditions:
+\[
+\vect{x}_{\mathrm{ref}}(0)=\vect{x}_0,
+\qquad
+\dot{\vect{x}}_{\mathrm{ref}}(0)=\vect{v}_0,
+\]
+\[
+\vect{x}_{\mathrm{ref}}(T)=\vect{x}_{\mathrm{rel}},
+\qquad
+\dot{\vect{x}}_{\mathrm{ref}}(T)=\vect{v}_{\mathrm{rel}}.
+\]
+
+Using the measured state prevents a discontinuity at throw-phase entry.
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 5: Normalize the Trajectory Time}
+
+Define elapsed and normalized time as
+\[
+\tau=t-t_0,
+\qquad
+s=\frac{\tau}{T},
+\qquad 0\leq s\leq 1.
+\]
+
+A cubic polynomial is sufficient because each Cartesian coordinate has
+four boundary conditions:
+\[
+x_{\mathrm{ref}}(s)=a_0+a_1s+a_2s^2+a_3s^3.
+\]
+
+The same construction is applied independently to the $x$, $y$, and $z$
+components. In vector form, this produces a three-dimensional object
+trajectory.
+
+\begin{block}{Why a cubic?}
+A cubic contains four coefficients, exactly enough to impose the initial
+position, initial velocity, terminal position, and terminal velocity.
+\end{block}
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 6: Cubic Hermite Position Reference}
+
+Define the Hermite basis functions
+\[
+\begin{aligned}
+h_{00}(s)&=2s^3-3s^2+1, &
+h_{10}(s)&=s^3-2s^2+s,\\
+h_{01}(s)&=-2s^3+3s^2, &
+h_{11}(s)&=s^3-s^2.
+\end{aligned}
+\]
+
+The reference position is
+\[
+\boxed{
+\vect{x}_{\mathrm{ref}}(s)
+=h_{00}(s)\vect{x}_0
++h_{10}(s)T\vect{v}_0
++h_{01}(s)\vect{x}_{\mathrm{rel}}
++h_{11}(s)T\vect{v}_{\mathrm{rel}}
+}
+\]
+
+The factors of $T$ convert endpoint velocities into position units.
+The basis functions are selected so that the four boundary conditions
+are satisfied exactly.
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 7: Reference Velocity}
+
+Because $s=\tau/T$, differentiation uses
+\[
+\frac{d}{dt}=\frac{1}{T}\frac{d}{ds}.
+\]
+
+Therefore,
+\[
+\boxed{
+\begin{aligned}
+\vect{v}_{\mathrm{ref}}(s)
+={}&\frac{6s^2-6s}{T}\vect{x}_0
++(3s^2-4s+1)\vect{v}_0\\
+&+\frac{-6s^2+6s}{T}\vect{x}_{\mathrm{rel}}
++(3s^2-2s)\vect{v}_{\mathrm{rel}}.
+\end{aligned}
+}
+\]
+
+Checking the endpoints gives
+\[
+\vect{v}_{\mathrm{ref}}(0)=\vect{v}_0,
+\qquad
+\vect{v}_{\mathrm{ref}}(1)=\vect{v}_{\mathrm{rel}}.
+\]
+
+Hence the object reaches the release point with a nonzero prescribed
+velocity instead of stopping there.
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 8: Closed-Loop Terminal Tracking}
+
+The polynomial is the feedforward motion reference. Feedback corrects
+tracking errors caused by robot dynamics, contacts, gravity, and limits:
+\[
+\vect{e}_x=\vect{x}_{\mathrm{ref}}-\vect{x},
+\qquad
+\vect{e}_v=\vect{v}_{\mathrm{ref}}-\vect{v}.
+\]
+
+The commanded object velocity is
+\[
+\boxed{
+\vect{v}_{o,\mathrm{cmd}}
+=\vect{v}_{\mathrm{ref}}
++\vect{K}_x\vect{e}_x
++\vect{K}_v\vect{e}_v
+}
+\]
+
+\begin{itemize}
+    \item $\vect{v}_{\mathrm{ref}}$: follows the planned motion.
+    \item $\vect{K}_x\vect{e}_x$: corrects position error.
+    \item $\vect{K}_v\vect{e}_v$: corrects velocity error.
+\end{itemize}
+
+For safety, the magnitude may be limited:
+\[
+\vect{v}_{o,\mathrm{cmd}}
+\leftarrow
+\min\!\left(1,\frac{v_{\max}}{\|\vect{v}_{o,\mathrm{cmd}}\|}\right)
+\vect{v}_{o,\mathrm{cmd}}.
+\]
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 9: Object Motion to Contact Motion}
+
+Let the commanded object twist be
+\[
+\vect{\mathcal{V}}_{o,\mathrm{cmd}}
+=\begin{bmatrix}\vect{v}_{o,\mathrm{cmd}}\\\vect{\omega}_{o,\mathrm{cmd}}\end{bmatrix}.
+\]
+
+For contact $i$, let $\vect{r}_i$ point from the object center to the
+contact point. Rigid-body kinematics gives
+\[
+\boxed{
+\vect{v}_{c_i}
+=\vect{v}_{o,\mathrm{cmd}}
++\vect{\omega}_{o,\mathrm{cmd}}\times\vect{r}_i
+}
+\]
+
+Equivalently,
+\[
+\vect{\mathcal{V}}_{c_i}
+=\underbrace{
+\begin{bmatrix}
+\vect{I}_3&-[\vect{r}_i]_{\times}\\
+\vect{0}&\vect{I}_3
+\end{bmatrix}}_{\vect{H}_i}
+\vect{\mathcal{V}}_{o,\mathrm{cmd}}.
+\]
+
+Both contacts receive the complete object motion. A velocity constraint is
+not divided by the number of arms. In the translational implementation,
+$\vect{\omega}_{o,\mathrm{cmd}}=\vect{0}$.
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 10: Add Contact-Level Admittance}
+
+Each hand regulates its grasp force using the measured contact wrench:
+\[
+\boxed{
+\Delta\vect{\mathcal{V}}_{a,i}
+=\vect{K}_{a}^{-1}
+\left(\vect{F}^{\star}_{i}-\vect{F}_{i}\right)
+}
+\]
+
+For grasp-force regulation, the translational correction is projected onto
+the pad-normal direction $\vect{n}_i$:
+\[
+\Delta\vect{v}_{a,i}
+=\vect{n}_i\vect{n}_i^T
+\left[\vect{K}_{a}^{-1}
+(\vect{F}^{\star}_{i}-\vect{F}_{i})\right]_{\mathrm{lin}}.
+\]
+
+The desired hand twists are then
+\[
+\boxed{
+\begin{bmatrix}
+\vect{\mathcal{V}}_{L}^{\star}\\
+\vect{\mathcal{V}}_{R}^{\star}
+\end{bmatrix}
+=
+\begin{bmatrix}
+\vect{H}_{L}\\
+\vect{H}_{R}
+\end{bmatrix}
+\vect{\mathcal{V}}_{o,\mathrm{cmd}}
++
+\begin{bmatrix}
+\Delta\vect{\mathcal{V}}_{a,L}\\
+\Delta\vect{\mathcal{V}}_{a,R}
+\end{bmatrix}
+}
+\]
+
+Thus, object transport and grasp-force correction are combined additively.
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 11: Convert Hand Velocities to Joint Velocities}
+
+Stack the two arm Jacobians:
+\[
+\vect{J}_{H}
+=
+\begin{bmatrix}
+\vect{J}_{L}&\vect{0}\\
+\vect{0}&\vect{J}_{R}
+\end{bmatrix},
+\qquad
+\begin{bmatrix}
+\vect{\mathcal{V}}_{L}\\
+\vect{\mathcal{V}}_{R}
+\end{bmatrix}
+=\vect{J}_{H}\dot{\vect{q}}.
+\]
+
+The desired joint velocity is computed using a damped least-squares
+pseudoinverse:
+\[
+\boxed{
+\dot{\vect{q}}_{\mathrm{des}}
+=\vect{J}_{H}^{\#}
+\begin{bmatrix}
+\vect{\mathcal{V}}_{L}^{\star}\\
+\vect{\mathcal{V}}_{R}^{\star}
+\end{bmatrix}
+}
+\]
+with
+\[
+\boxed{
+\vect{J}_{H}^{\#}
+=\vect{J}_{H}^{T}
+\left(\vect{J}_{H}\vect{J}_{H}^{T}
++\lambda^2\vect{I}\right)^{-1}
+}
+\]
+
+The damping $\lambda>0$ improves numerical robustness near singularities.
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 12: Joint-Velocity Tracking}
+
+Define the joint-velocity error
+\[
+\vect{e}_{\dot q}
+=\dot{\vect{q}}_{\mathrm{des}}-\dot{\vect{q}}.
+\]
+
+A velocity PID controller produces the commanded joint torque:
+\[
+\boxed{
+\vect{\tau}_{\mathrm{cmd}}
+=\vect{K}_{d}\vect{e}_{\dot q}
++\vect{K}_{i}\int\vect{e}_{\dot q}\,dt
++\vect{\tau}_{\mathrm{fric}}
++\vect{\tau}_{\mathrm{bias}}
+}
+\]
+
+where
+\begin{itemize}
+    \item $\vect{\tau}_{\mathrm{fric}}$ is friction feedforward,
+    \item $\vect{\tau}_{\mathrm{bias}}$ compensates gravity, Coriolis,
+          and centrifugal effects,
+    \item torque and joint-velocity limits are enforced for safety.
+\end{itemize}
+
+Gravity remains active in the physical simulation; bias compensation helps
+the robots track the commanded motion while carrying the object.
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 13: Terminal Release Condition}
+
+At and after the nominal terminal time $T$, calculate
+\[
+e_p=\left\|\vect{x}-\vect{x}_{\mathrm{rel}}\right\|,
+\qquad
+e_v=\left\|\vect{v}-\vect{v}_{\mathrm{rel}}\right\|.
+\]
+
+Release is allowed only if
+\[
+\boxed{
+\tau\geq T,
+\qquad
+e_p<\varepsilon_p,
+\qquad
+e_v<\varepsilon_v
+}
+\]
+
+\begin{itemize}
+    \item The time condition ensures the terminal reference has been reached.
+    \item The position condition ensures release occurs at the planned point.
+    \item The velocity condition ensures the required launch velocity has
+          actually been achieved.
+\end{itemize}
+
+If these conditions are not satisfied, the controller keeps tracking the
+terminal state rather than releasing at a poor state.
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 14: Opening and Follow-Through}
+
+When release is triggered, grasp-force closure is disabled and the hands
+open along opposing outward normals.
+
+For each hand,
+\[
+\boxed{
+\vect{v}_{ee,i}^{\mathrm{release}}
+=\vect{v}_{\mathrm{rel}}
++v_{\mathrm{out}}\vect{n}_{\mathrm{out},i}
+}
+\]
+
+\begin{itemize}
+    \item $\vect{v}_{\mathrm{rel}}$ keeps the hand moving with the object.
+    \item $v_{\mathrm{out}}\vect{n}_{\mathrm{out},i}$ separates the fingers
+          from the object.
+    \item Co-motion prevents the hands from abruptly braking the object while
+          contact is disappearing.
+\end{itemize}
+
+After the short opening interval, the arms enter follow-through while the
+object continues independently.
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Step 15: Free Flight After Release}
+
+Once contact is lost, the robot controller no longer determines the object
+trajectory. The simulator integrates the physical dynamics.
+
+Under the ideal ballistic model,
+\[
+\boxed{
+\ddot{\vect{p}}=\vect{g}
+}
+\]
+with the release initial conditions
+\[
+\vect{p}(0)=\vect{p}_{\mathrm{rel}},
+\qquad
+\dot{\vect{p}}(0)=\vect{v}_{\mathrm{rel}}.
+\]
+
+Therefore,
+\[
+\boxed{
+\vect{p}(t)
+=\vect{p}_{\mathrm{rel}}
++\vect{v}_{\mathrm{rel}}t
++\frac{1}{2}\vect{g}t^2
+}
+\]
+
+The controlled phase establishes the release state; gravity then produces
+the free-flight trajectory.
+
+\end{frame}
+
+%------------------------------------------------
+\begin{frame}{Complete New Formulation}
+
+\begin{enumerate}
+    \item Select $\vect{p}_{\mathrm{rel}}$, $\vect{p}_{\mathrm{land}}$,
+          and launch angle $\theta$.
+    \item Compute $\vect{v}_{\mathrm{rel}}$ from projectile motion.
+    \item Measure the actual initial state $(\vect{x}_0,\vect{v}_0)$.
+    \item Construct a cubic Hermite trajectory over duration $T$.
+    \item Add position and velocity feedback to obtain
+          $\vect{v}_{o,\mathrm{cmd}}$.
+    \item Map the object twist to both rigid contacts and add grasp
+          admittance corrections.
+    \item Use the stacked damped Jacobian inverse to obtain
+          $\dot{\vect{q}}_{\mathrm{des}}$.
+    \item Track the desired joint velocity with bias-compensated torque control.
+    \item Release only when both terminal position and velocity are achieved.
+    \item Co-move while opening; then allow gravity-driven free flight.
+\end{enumerate}
+
+\begin{block}{Central idea}
+The release state is a finite-time boundary condition through which the
+object passes, not a stationary equilibrium to which it converges.
+\end{block}
+
+\end{frame}
+
+%------------------------------------------------
+\end{document}

@@ -4,6 +4,13 @@ from __future__ import annotations
 
 import argparse
 import contextlib
+import os
+import sys
+
+# MuJoCo must choose its OpenGL backend before it is imported.  EGL enables
+# off-screen recording on machines without a desktop/display server.
+if "--headless" in sys.argv:
+    os.environ.setdefault("MUJOCO_GL", "egl")
 
 import mujoco
 import mujoco.viewer
@@ -15,12 +22,23 @@ from logger import SimLogger
 from mj_interface import MjInterface
 from state_machine import Phase
 from state_machine_trajectory import TrajectoryThrowStateMachine
+from video_recorder import CAMERA_PRESETS, POINT_STYLES, ThrowVideoRecorder, add_throw_markers
 
 
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--headless", action="store_true")
     parser.add_argument("--duration", type=float, default=8.0)
+    parser.add_argument("--record", action="store_true",
+                        help="record annotated videos from multiple camera angles")
+    parser.add_argument("--video-dir", default="throw_videos")
+    parser.add_argument("--video-fps", type=float, default=30.0)
+    parser.add_argument("--video-width", type=int, default=1920)
+    parser.add_argument("--video-height", type=int, default=1080)
+    parser.add_argument(
+        "--cameras", default="front,side,oblique",
+        help=f"comma-separated camera presets: {','.join(CAMERA_PRESETS)}",
+    )
     args = parser.parse_args()
 
     model = mujoco.MjModel.from_xml_path(config.XML_PATH)
@@ -33,6 +51,17 @@ def main():
     logger = SimLogger()
     trajectory_diagnostics = []
     previous_phase = None
+    actual_landing_position = np.full(3, np.nan)
+    recorder = None
+    if args.record:
+        camera_names = [name.strip() for name in args.cameras.split(",") if name.strip()]
+        recorder = ThrowVideoRecorder(
+            model, args.video_dir, camera_names, args.video_fps,
+            args.video_width, args.video_height,
+        )
+    print("Point-marker colors:")
+    for label, _, rgba, _ in POINT_STYLES:
+        print(f"  {label}: RGBA {rgba}")
 
     viewer_context = (
         contextlib.nullcontext(None) if args.headless
@@ -45,6 +74,14 @@ def main():
             clipped_left = interface.set_ctrl("left", torque_left)
             clipped_right = interface.set_ctrl("right", torque_right)
             mujoco.mj_step(model, data)
+            if machine.phase == Phase.DONE:
+                actual_landing_position = interface.get_object_state()["pos"].copy()
+            marker_points = {
+                "theoretical_release": config.RELEASE_POINT,
+                "actual_release": machine.actual_release_position,
+                "theoretical_landing": config.LANDING_POINT,
+                "actual_landing": actual_landing_position,
+            }
             if machine.phase != previous_phase:
                 print(f"[t={t:.3f}s] phase -> {machine.phase.value}")
                 previous_phase = machine.phase
@@ -84,9 +121,23 @@ def main():
                     clipped_left, clipped_right,
                 )
             if viewer is not None:
+                with viewer.lock():
+                    viewer.user_scn.ngeom = 0
+                    add_throw_markers(viewer.user_scn, marker_points)
                 viewer.sync()
                 if not viewer.is_running():
                     break
+
+            if recorder is not None:
+                recorder.capture(
+                    data, t, machine.phase.value, marker_points,
+                )
+
+    if recorder is not None:
+        recorder.close()
+        print("Saved videos:")
+        for path in recorder.paths:
+            print(f"  {path}")
 
     df = logger.to_dataframe()
     diag_df = pd.DataFrame(trajectory_diagnostics)

@@ -75,9 +75,9 @@ def main():
         k_theoretical_land = k_release + int(landed[0])
         theoretical[k_theoretical_land + 1:] = np.nan
 
-    fig = plt.figure(figsize=(16, 12), constrained_layout=True)
-    gs = fig.add_gridspec(2, 2)
-    ax3 = fig.add_subplot(gs[:, 0], projection="3d")
+    fig = plt.figure(figsize=(16, 8), constrained_layout=True)
+    gs = fig.add_gridspec(1, 2)
+    ax3 = fig.add_subplot(gs[0, 0], projection="3d")
     ax3.plot(*p.T, color="black", lw=2, label="achieved box path")
     valid = np.isfinite(theoretical[:, 0])
     ax3.plot(*theoretical[valid].T, color="tab:red", ls="--", lw=2, label="calculated path")
@@ -102,12 +102,6 @@ def main():
     axp.set(title="Box position: calculated vs achieved", xlabel="time [s]", ylabel="position [m]")
     axp.grid(alpha=.25); axp.legend(ncol=2, fontsize=8)
 
-    axe = fig.add_subplot(gs[1, 1])
-    position_error = np.linalg.norm(p - theoretical, axis=1)
-    axe.plot(t[valid], 1000 * position_error[valid], color="tab:red")
-    axe.axvline(t_release, color="black", ls=":")
-    axe.set(title="3D box path error", xlabel="time [s]", ylabel="error [mm]")
-    axe.grid(alpha=.25)
     fig.savefig("trajectory_validation_3d.png", dpi=180)
 
     # A separate full-size 3D figure is easier to inspect than the 3D panel in
@@ -135,7 +129,7 @@ def main():
     ax3d.legend(fontsize=9)
     fig3d.savefig("box_trajectory_3d.png", dpi=200)
 
-    fig2, axes = plt.subplots(4, 1, figsize=(14, 16), sharex=True, constrained_layout=True)
+    fig2, axes = plt.subplots(3, 1, figsize=(14, 12), sharex=True, constrained_layout=True)
     throw_mask = (np.arange(len(df)) >= k_throw) & (np.arange(len(df)) <= k_release)
     for j, (axis, color) in enumerate(zip(XYZ, COLORS)):
         axes[0].plot(t[throw_mask], vec(df, "v_ref")[throw_mask, j], ls="--", color=color, label=f"reference {axis}")
@@ -153,13 +147,7 @@ def main():
         axes[row].set(title=f"{side.capitalize()} end-effector linear velocity", ylabel="velocity [m/s]")
         axes[row].legend(ncol=3, fontsize=8); axes[row].grid(alpha=.25)
 
-    v_error = np.linalg.norm(vec(df, "v_ref") - v, axis=1)
-    cmd_error = np.linalg.norm(vec(df, "v_obj_cmd") - v, axis=1)
-    axes[3].plot(t[throw_mask], v_error[throw_mask], label="|reference - actual|")
-    axes[3].plot(t[throw_mask], cmd_error[throw_mask], label="|command - actual|")
-    axes[3].axhline(config.RELEASE_VELOCITY_TOLERANCE, color="tab:red", ls="--", label="release tolerance")
-    axes[3].set(title="Box velocity tracking errors", xlabel="time [s]", ylabel="error [m/s]")
-    axes[3].legend(); axes[3].grid(alpha=.25)
+    axes[2].set_xlabel("time [s]")
     fig2.savefig("trajectory_velocity_validation.png", dpi=180)
 
     print("MuJoCo gravity:", gravity)
